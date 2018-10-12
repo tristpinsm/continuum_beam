@@ -2,6 +2,8 @@ import healpy
 import numpy as np
 from ch_util import ephemeris as ephem
 from caput.time import unix_to_skyfield_time
+#import pyximport; pyximport.install(reload_support=True)
+from mat_prod import outer_sum
 
 class ModelVis(object):
     c = 2.99792458e2
@@ -16,7 +18,7 @@ class ModelVis(object):
         self.nside = int((self.basemap.shape[0]/12)**0.5)
         self.smoothmap = healpy.sphtfunc.smoothing(self.basemap, sigma=self._res())
 
-        # get an observer at CHIME
+        # get an observer at CHIME arguments
         self.obs = ephem.chime_observer().skyfield_obs()
 
     def set_baselines(self, baselines=None):
@@ -37,9 +39,18 @@ class ModelVis(object):
         self._gen_basis(times, vis, n, max_za)
         # construct least squares equation
         # take the real part since we omit the lower half of the vis matrix
-        M = np.sum(np.matmul(self._basis[:,:,:,np.newaxis], self._basis[:,:,np.newaxis,:]).real
-                   * weight[:,:,np.newaxis,np.newaxis], axis=(0,1))
-        v = np.sum(((vis * weight)[:,:,np.newaxis] * self._basis).real, axis=(0,1))
+        #M = np.sum(np.matmul(self._basis[:,:,:,np.newaxis], self._basis[:,:,np.newaxis,:]).real
+        #           * weight[:,:,np.newaxis,np.newaxis], axis=(0,1))
+        M = np.zeros((n, n), dtype=np.float32)
+        #for i in range(n):
+        #    for j in range(i, n):wgt_cal[:,time_slice]
+        #        M[i,j] = np.sum((self._basis[:,:,i] * self._basis[:,:,j]).real
+        #                        * weight[:,:,np.newaxis], axis=(0,1))
+        #        M[j,i] = M[i,j]
+        M = outer_sum(self._basis, weight, M)
+        self.M = M
+        v = np.sum(((vis * weight)[:,:,np.newaxis] * self._basis.conj()).real, axis=(0,1))
+        self.v = v
         # return solution
         return np.dot(np.linalg.inv(M), v)
 
