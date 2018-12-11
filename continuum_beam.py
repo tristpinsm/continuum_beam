@@ -5,6 +5,7 @@ from caput.time import unix_to_skyfield_time
 #import pyximport; pyximport.install(reload_support=True)
 from mat_prod import outer_sum
 
+
 class ModelVis(object):
     c = 2.99792458e2
     synch_ind = -0.75
@@ -34,35 +35,51 @@ class ModelVis(object):
             # generate them
             pass
 
-    def get_vis(self, times, vis, n, max_za=90.):
+    def get_vis(self, times, vis, n, max_za=90., beam=1.):
         # use this to check/visualize model
-        self._gen_basis(times, vis, n, max_za)
+        self._gen_basis(times, vis, n, max_za, beam)
         return np.sum(self._basis, axis=2)
 
+    def fit_beam(self, times, vis, weight, n, max_za=90., rcond=1e-15,
+                 xtalk_iter=None):
+        if xtalk_iter is None:
+            xtalk = 0.
+            xtalk_iter = 1
+        else:
+            # for first iteration just remove median value
+            xtalk = vis.median(axis=-1)
 
-    def fit_beam(self, times, vis, weight, n, max_za=90., rcond=1e-15):
-        # generate model basis
-        self._gen_basis(times, vis, n, max_za)
-        # construct least squares equation
-        # take the real part since we omit the lower half of the vis matrix
-        M = np.zeros((n, n), dtype=np.float32)
-        v = np.zeros((n,), dtype=np.float32)
-        for t in range(vis.shape[1]):
-            M += np.dot(self._basis[:,t,:].T.conj() * weight[:,t],
-                        self._basis[:,t,:]).real
-            v += np.dot((vis * weight)[:,t].T, self._basis.conj()[:,t,:]).real
-        #for i in range(n):
-        #    for j in range(i, n):wgt_cal[:,time_slice]
-        #        M[i,j] = np.sum((self._basis[:,:,i] * self._basis[:,:,j]).real
-        #                        * weight[:,:,np.newaxis], axis=(0,1))
-        #        M[j,i] = M[i,j]
-        #M = outer_sum(self._basis, weight, M)
+        for i in range(xtalk_iter):
+            # generate model basis
+            self._gen_basis(times, vis - xtalk, n, max_za)
+            # construct least squares equation
+            # take the real part since we omit the lower half of the vis matrix
+            M = np.zeros((n, n), dtype=np.float32)
+            v = np.zeros((n,), dtype=np.float32)
+            for t in range(vis.shape[1]):
+                M += np.dot(self._basis[:,t,:].T.conj() * weight[:,t],
+                            self._basis[:,t,:]).real
+                v += np.dot((vis * weight)[:,t].T, self._basis.conj()[:,t,:]).real
+            #for i in range(n):
+            #    for j in range(i, n):wgt_cal[:,time_slice]
+            #        M[i,j] = np.sum((self._basis[:,:,i] * self._basis[:,:,j]).real
+            #                        * weight[:,:,np.newaxis], axis=(0,1))
+            #        M[j,i] = M[i,j]
+            #M = outer_sum(self._basis, weight, M)
+            res = np.dot(np.linalg.pinv(M, rcond=rcond), v)
+
+            # update cross-talk estimate using fit result
+            if xtalk_iter is not None:
+                xtalk = (vis - self.get_vis(times, vis, n, max_za, res)).median(axis=-1)
+
+        # Save intermediate products for debugging
         self.M = M
         self.v = v
+        self.xtalk = xtalk
         # return solution
-        return np.dot(np.linalg.pinv(M, rcond=rcond), v)
+        return res
 
-    def _gen_basis(self, times, vis, n, max_za=90.):
+    def _gen_basis(self, times, vis, n, max_za=90., beam=1.):
         # evaluate Haslam map at n declinations and all times
         za = np.linspace(-max_za, max_za, n)
         az = np.zeros_like(za)
@@ -70,13 +87,13 @@ class ModelVis(object):
         alt = 90. - np.cos(np.radians(az)) * za
         self.za = za
         self._basis = np.zeros((vis.shape[0], vis.shape[1], za.shape[0]), dtype=np.complex64)
-        phases = np.exp(1j * self._fringe_phase(za))
+        weights = np.exp(1j * self._fringe_phase(za)) * beam
         for i, t in enumerate(times):
             sf_t = unix_to_skyfield_time(t)
             pos = self.obs.at(sf_t).from_altaz(az_degrees=az, alt_degrees=alt)
             gallat, gallon = pos.galactic_latlon()[:2]
             pix = healpy.ang2pix(self.nside, gallon.degrees, gallat.degrees, lonlat=True)
-            self._basis[:,i,:] = self.smoothmap[pix] * phases
+            self._basis[:,i,:] = self.smoothmap[pix] * weights
 
     def _res(self):
         # match FWHM of sinc for 20m aperture
