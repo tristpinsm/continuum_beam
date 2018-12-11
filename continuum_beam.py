@@ -49,7 +49,8 @@ class ModelVis(object):
         self.fit_beam(times, vis, weight, n, max_za)
         return self.chi2
 
-    def fit_beam(self, times, vis, weight, n, max_za=90., rcond=None):
+    def fit_beam(self, times, vis, weight, n, max_za=90., rcond=None,
+                 xtalk_iter=None):
         if xtalk_iter is None:
             xtalk = 0.
             xtalk_iter = 1
@@ -99,13 +100,13 @@ class ModelVis(object):
         alt = 90. - np.cos(np.radians(az)) * za
         self.za = za
         self._basis = np.zeros((vis.shape[0], vis.shape[1], za.shape[0]), dtype=np.complex64)
-        weights = np.exp(1j * self._fringe_phase(za)) * beam
+        phases = np.exp(1j * self._fringe_phase(za))
         for i, t in enumerate(times):
             sf_t = unix_to_skyfield_time(t)
             pos = self.obs.at(sf_t).from_altaz(az_degrees=az, alt_degrees=alt)
             gallat, gallon = pos.galactic_latlon()[:2]
             pix = healpy.ang2pix(self.nside, gallon.degrees, gallat.degrees, lonlat=True)
-            self._basis[:,i,:] = self.smoothmap[pix] * weights
+            self._basis[:,i,:] = self.smoothmap[pix] * phases
 
     def _res(self):
         # match FWHM of sinc for 20m aperture
