@@ -29,6 +29,9 @@ class ModelVis(object):
         # get an observer at CHIME arguments
         self.obs = ephem.chime_observer().skyfield_obs()
 
+        self.xtalk = None
+        self.chi2 = None
+
     def set_baselines(self, baselines=None):
         if type(baselines) is np.ndarray:
             self.ns_baselines = baselines
@@ -40,27 +43,31 @@ class ModelVis(object):
         # use this to check/visualize model
         self._gen_basis(times, vis, n, max_za)
         if model_beam is None:
-            beam = np.ones_like(self.za)
+            beam = 1.
         else:
-            beam = model_beam(self.za)
+            beam = model_beam
         return np.sum(self._basis * beam, axis=2)
 
-    def get_chi2(self, times, vis, weight, n, max_za=90.):
-        self.fit_beam(times, vis, weight, n, max_za)
-        return self.chi2
+    def get_chi2(self):
+        if self.chi2 is not None:
+            return self.chi2
+        else:
+            raise Exception("No chi^2 is available until a fit is performed.")
 
     def fit_beam(self, times, vis, weight, n, max_za=90., rcond=None,
-                 xtalk_iter=None):
-        if xtalk_iter is None:
-            xtalk = 0.
-            xtalk_iter = 1
+                 xtalk_iter=1, resume=False):
+        if resume and self.xtalk is not None:
+            xtalk = self.xtalk
+            self.total_iter += xtalk_iter
         else:
-            # for first iteration just remove median value
-            xtalk = vis.median(axis=-1)
+            # for first iteration remove nothing
+            xtalk = np.zeros(vis.shape[0])
+            self.total_iter = xtalk_iter
 
         for i in range(xtalk_iter):
+            print("\rCrosstalk iteration {:d}/{:d}...".format(i, xtalk_iter)),
             # generate model basis
-            self._gen_basis(times, vis - xtalk, n, max_za)
+            self._gen_basis(times, vis, n, max_za)
             # construct least squares equation
             # take the real part since we omit the lower half of the vis matrix
             M = np.zeros((n, n), dtype=np.float64)
@@ -68,7 +75,8 @@ class ModelVis(object):
             for t in range(vis.shape[1]):
                 M += np.dot(self._basis[:,t,:].T.conj() * weight[:,t],
                             self._basis[:,t,:]).real
-                v += np.dot((vis * weight)[:,t].T, self._basis.conj()[:,t,:]).real
+                v += np.dot(((vis - xtalk[:,np.newaxis]) * weight)[:,t].T,
+                            self._basis.conj()[:,t,:]).real
             # normalize to order unity
             #norm = np.median(np.abs(v))
             #v /= norm
@@ -79,8 +87,11 @@ class ModelVis(object):
             else:
                 self.beam_sol = np.dot(np.linalg.pinv(M, rcond=rcond), v)
             # update cross-talk estimate using fit result
-            if xtalk_iter is not None:
-                xtalk = (vis - self.get_vis(times, vis, n, max_za, self.beam_sol)).median(axis=-1)
+            xtalk = np.mean(
+                    vis - self.get_vis(times, vis, n, max_za, self.beam_sol),
+                    axis=-1
+            )
+        print("\nDone {:d} iterations.".format(self.total_iter))
         # save intermediate products for debugging
         self.M = M
         self.v = v
@@ -94,13 +105,16 @@ class ModelVis(object):
 
     def _gen_basis(self, times, vis, n, max_za=90.):
         # evaluate Haslam map at n declinations and all times
-        za = np.linspace(-max_za, max_za, n)
+        max_sinza = np.sin(np.radians(max_za))
+        sinza = np.linspace(-max_sinza, max_sinza, n)
+        za = np.arcsin(sinza)
         az = np.zeros_like(za)
         az[:n/2] = 180.
-        alt = 90. - np.cos(np.radians(az)) * za
+        alt = 90. - np.cos(np.radians(az)) * np.degrees(za)
         self.za = za
+        self.sinza = sinza
         self._basis = np.zeros((vis.shape[0], vis.shape[1], za.shape[0]), dtype=np.complex64)
-        phases = np.exp(1j * self._fringe_phase(za))
+        phases = np.exp(1j * self._fringe_phase(sinza))
         for i, t in enumerate(times):
             sf_t = unix_to_skyfield_time(t)
             pos = self.obs.at(sf_t).from_altaz(az_degrees=az, alt_degrees=alt)
@@ -112,5 +126,5 @@ class ModelVis(object):
         # match FWHM of sinc for 20m aperture
         return self.wl / 20. / 1.95
 
-    def _fringe_phase(self, za):
-        return 2 * np.pi * self.ns_baselines[:,np.newaxis] / self.wl * np.sin(np.radians(za))[np.newaxis,:]
+    def _fringe_phase(self, sinza):
+        return 2 * np.pi * self.ns_baselines[:,np.newaxis] / self.wl * sinza[np.newaxis,:]
