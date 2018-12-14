@@ -55,7 +55,7 @@ class ModelVis(object):
             raise Exception("No chi^2 is available until a fit is performed.")
 
     def fit_beam(self, times, vis, weight, n, max_za=90., rcond=None,
-                 xtalk_iter=1, resume=False):
+                 xtalk_iter=1, resume=False, t_stride=1):
         if resume and self.xtalk is not None:
             xtalk = self.xtalk
             self.total_iter += xtalk_iter
@@ -63,6 +63,9 @@ class ModelVis(object):
             # for first iteration remove nothing
             xtalk = np.zeros(vis.shape[0])
             self.total_iter = xtalk_iter
+
+        if times.shape[0] % t_stride != 0:
+            raise Exception("t_stride must divide time axis exactly.")
 
         for i in range(xtalk_iter):
             print("\rCrosstalk iteration {:d}/{:d}...".format(i, xtalk_iter)),
@@ -72,11 +75,24 @@ class ModelVis(object):
             # take the real part since we omit the lower half of the vis matrix
             M = np.zeros((n, n), dtype=np.float64)
             v = np.zeros((n,), dtype=np.float64)
-            for t in range(vis.shape[1]):
-                M += np.dot(self._basis[:,t,:].T.conj() * weight[:,t],
-                            self._basis[:,t,:]).real
-                v += np.dot(((vis - xtalk[:,np.newaxis]) * weight)[:,t].T,
-                            self._basis.conj()[:,t,:]).real
+            if t_stride > 1:
+                wgt_view = weight.reshape(t_stride * weight.shape[0],
+                                          weight.shape[1] / t_stride)
+                vis_view = vis.reshape(t_stride * vis.shape[0],
+                                       vis.shape[1] / t_stride)
+                basis = self._basis.reshape(t_stride * vis.shape[0],
+                                            vis.shape[1] / t_stride, n)
+                xtalk_view = np.concatenate([xtalk] * t_stride)
+            else:
+                wgt_view = weight
+                vis_view = vis
+                xtalk_view = xtalk
+                basis = self._basis
+            for t in range(vis_view.shape[1]):
+                M += np.dot(basis[:,t,:].T.conj() * wgt_view[:,t],
+                            basis[:,t,:]).real
+                v += np.dot(((vis_view[:,t] - xtalk_view) * wgt_view[:,t]).T,
+                            basis.conj()[:,t,:]).real
             # normalize to order unity
             #norm = np.median(np.abs(v))
             #v /= norm
@@ -91,6 +107,7 @@ class ModelVis(object):
                     vis - self.get_vis(times, vis, n, max_za, self.beam_sol),
                     axis=-1
             )
+            del xtalk_view, vis_view, wgt_view, basis
         print("\nDone {:d} iterations.".format(self.total_iter))
         # save intermediate products for debugging
         self.M = M
