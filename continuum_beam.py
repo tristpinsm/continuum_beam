@@ -10,18 +10,26 @@ class ModelVis(object):
     c = 2.99792458e2
     synch_ind = -0.75
 
-    def __init__(self, fname="./lambda_haslam408_nofilt.fits", freq=408.):
+    def __init__(self, fname="./lambda_haslam408_nofilt.fits", freq=408., smooth=True,
+                 sky_map=None):
         # observed frequency
         self.freq = freq
         self.wl = self.c / freq
 
         self.synch_ind = -0.75
 
-        # smooth map using CHIME EW primary beam
-        self.basemap = healpy.fitsfunc.read_map(fname)
+        # load sky map
+        if sky_map is not None:
+            self.basemap = sky_map
+        else:
+            self.basemap = healpy.fitsfunc.read_map(fname)
         self.nside = int((self.basemap.shape[0]/12)**0.5)
-        self.smoothmap = healpy.sphtfunc.smoothing(self.basemap, sigma=self._res())
-        #self.smoothmap = self.basemap
+
+        # smooth map using CHIME EW primary beam
+        if smooth:
+            self.smoothmap = healpy.sphtfunc.smoothing(self.basemap, sigma=self._res())
+        else:
+            self.smoothmap = self.basemap
 
         # scale map with average synchrotron index
         #self.smoothmap *= (freq / 408.)**self.synch_ind
@@ -62,6 +70,7 @@ class ModelVis(object):
         else:
             # for first iteration remove nothing
             xtalk = np.zeros(vis.shape[0])
+            #xtalk = np.sum(vis * weight, axis=1) / np.sum(weight, axis=1)
             self.total_iter = xtalk_iter
 
         if times.shape[0] % t_stride != 0:
@@ -103,10 +112,11 @@ class ModelVis(object):
             else:
                 self.beam_sol = np.dot(np.linalg.pinv(M, rcond=rcond), v)
             # update cross-talk estimate using fit result
-            xtalk = np.mean(
-                    vis - self.get_vis(times, vis, n, max_za, self.beam_sol),
-                    axis=-1
-            )
+            resid = vis - self.get_vis(times, vis, n, max_za, self.beam_sol)
+            #mad_resid = np.median(np.abs(resid - np.median(resid, axis=1)[:,np.newaxis]), axis=1)
+            #xtalk = np.mean(resid * (np.abs(resid) < 3 * mad_resid[:,np.newaxis]), axis=1)
+            #xtalk = np.sum(resid * weight, axis=-1) / np.sum(weight, axis=-1)
+            xtalk = np.mean(resid, axis=-1)
             del xtalk_view, vis_view, wgt_view, basis
         print("\nDone {:d} iterations.".format(self.total_iter))
         # save intermediate products for debugging
