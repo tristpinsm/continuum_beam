@@ -2,6 +2,7 @@ import healpy
 import numpy as np
 from ch_util import ephemeris as ephem
 from caput.time import unix_to_skyfield_time
+from drift.telescope import cylbeam
 
 
 class ModelVis(object):
@@ -38,16 +39,15 @@ class ModelVis(object):
         self.xtalk = None
         self.chi2 = None
 
-    def set_baselines(self, baselines=None):
-        if type(baselines) is np.ndarray:
-            self.ns_baselines = baselines
-        elif type(baselines) is int or type(baselines) is float:
-            # generate them
-            pass
+    def set_baselines(self, ns_baselines, ew_baselines=None):
+        self.ns_baselines = ns_baselines
+        self.ew_baselines = ew_baselines
 
-    def get_vis(self, times, vis, n, max_za=90., model_beam=None):
+    def get_vis(self, times, vis, n, max_za=90.,
+                model_beam=None, skip_basis=False):
         # use this to check/visualize model
-        self._gen_basis(times, vis, n, max_za)
+        if not skip_basis:
+            self._gen_basis(times, vis, n, max_za)
         if model_beam is None:
             beam = 1.
         else:
@@ -71,15 +71,14 @@ class ModelVis(object):
             # for first iteration remove nothing
             xtalk = np.zeros(vis.shape[0])
             self.total_iter = xtalk_iter
-
-        # generate model basis
-        self._gen_basis(times, vis, n, max_za)
+            # generate model basis
+            self._gen_basis(times, vis, n, max_za)
 
         # least squares beam fit, crosstalk iterations
         for i in range(xtalk_iter):
             print("\rCrosstalk iteration {:d}/{:d}...".format(i+1, xtalk_iter)),
             # least squares solution
-            self._lls_beam_sol(vis, weight, xtalk, rcond)
+            self._lls_beam_sol(vis, weight, n, xtalk, rcond)
             # update cross-talk estimate using fit result
             resid = vis - self.get_vis(times, vis, n, max_za, self.beam_sol)
             #mad_resid = np.median(np.abs(resid - np.median(resid, axis=1)[:,np.newaxis]), axis=1)
@@ -114,7 +113,7 @@ class ModelVis(object):
             chain['xtalk'][i] = xtalk_sample
         self.chain = chain
 
-    def _lls_beam_sol(self, vis, weight, xtalk=0, rcond=None):
+    def _lls_beam_sol(self, vis, weight, n, xtalk=0, rcond=None):
         # construct least squares equation
         # take the real part since we omit the lower half of the vis matrix
         M = np.zeros((n, n), dtype=np.float64)
@@ -134,8 +133,6 @@ class ModelVis(object):
         self.v = v
 
     def _gen_basis(self, times, vis, n, max_za=90.):
-        # TODO: pre-genrate a map of model sky convolved with EW beam
-        ew_beam = None  # TODO: write down beam model
 
         # evaluate Haslam map at n declinations and all times
         # make za axis
@@ -148,28 +145,41 @@ class ModelVis(object):
         self.za = za
         self.sinza = sinza
         self._basis = np.zeros((vis.shape[0], vis.shape[1], za.shape[0]), dtype=np.complex64)
-        phases = np.exp(1j * self._fringe_phase(sinza))
         # make EW grid to integrate over
-        phi = np.linspace(-self._res(), self._res(), 10)
+        phi = np.linspace(-8*self._res(), 8*self._res(), 20)
         z, p = np.meshgrid(za, phi)
+        self.z, self.p = z, p
         alt, az = tel2azalt(z, p)
+        # model the EW beam as a sinc
+        ew_beam = cylbeam.fraunhofer_cylinder(lambda x: np.ones_like(x), 20.)
+        ew_beam = ew_beam(p)**2
+        self.ew_beam = ew_beam
+        # calculate phases within beam
+        phases = np.exp(1j * self._fringe_phase(z, p))
         for i, t in enumerate(times):
             sf_t = unix_to_skyfield_time(t)
-            pix = np.zeros((alt.shape[0], alt.shape[1]),
-                           dtype=[('gallat', np.float32), ('gallon', np.float32)])
+            pix = np.zeros((alt.shape[0], alt.shape[1]), dtype=int)
             for j in range(alt.shape[0]):
                 for k in range(alt.shape[1]):
-                    pos = self.obs.at(sf_t).from_altaz(az_degrees=az[j,k], alt_degrees=alt[j,k])
+                    pos = self.obs.at(sf_t).from_altaz(az_degrees=np.degrees(az[j,k]),
+                                                       alt_degrees=np.degrees(alt[j,k]))
                     gallat, gallon = pos.galactic_latlon()[:2]
                     pix[j,k] = healpy.ang2pix(self.nside, gallon.degrees, gallat.degrees, lonlat=True)
-            self._basis[:,i,:] = np.sum(self.smoothmap[pix] * ew_beam * phases, axis=0)
+            if len(phases.shape) > 2:
+                self._basis[:,i,:] = np.sum(self.smoothmap[pix] * ew_beam * phases, axis=1)
+            else:
+                self._basis[:,i,:] = self.smoothmap[pix] * ew_beam * phases
 
     def _res(self):
         # match FWHM of sinc for 20m aperture
         return self.wl / 20. / 1.95
 
-    def _fringe_phase(self, sinza):
-        return 2 * np.pi * self.ns_baselines[:,np.newaxis] / self.wl * sinza[np.newaxis,:]
+    def _fringe_phase(self, za, phi=None):
+        phases = self.ns_baselines[np.newaxis,:] * np.sin(za)[...,np.newaxis]
+        if phi is not None:
+            phases += self.ew_baselines[np.newaxis,...] * (np.sin(phi) * np.cos(za))[...,np.newaxis]
+        phases = np.moveaxis(phases, -1, 0)
+        return 2 * np.pi / self.wl * phases
 
 
 def altaz2tel(alt, az, deg=False, reverse=False):
