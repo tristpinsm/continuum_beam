@@ -2,8 +2,6 @@ import healpy
 import numpy as np
 from ch_util import ephemeris as ephem
 from caput.time import unix_to_skyfield_time
-#import pyximport; pyximport.install(reload_support=True)
-from mat_prod import outer_sum
 
 
 class ModelVis(object):
@@ -63,65 +61,32 @@ class ModelVis(object):
             raise Exception("No chi^2 is available until a fit is performed.")
 
     def fit_beam(self, times, vis, weight, n, max_za=90., rcond=None,
-                 xtalk_iter=1, resume=False, t_stride=1):
+                 xtalk_iter=1, resume=False):
+
+        # Initialize xtalk
         if resume and self.xtalk is not None:
             xtalk = self.xtalk
             self.total_iter += xtalk_iter
         else:
             # for first iteration remove nothing
             xtalk = np.zeros(vis.shape[0])
-            #xtalk = np.sum(vis * weight, axis=1) / np.sum(weight, axis=1)
             self.total_iter = xtalk_iter
 
-        if times.shape[0] % t_stride != 0:
-            raise Exception("t_stride must divide time axis exactly.")
+        # generate model basis
+        self._gen_basis(times, vis, n, max_za)
 
+        # least squares beam fit, crosstalk iterations
         for i in range(xtalk_iter):
-            print("\rCrosstalk iteration {:d}/{:d}...".format(i, xtalk_iter)),
-            # generate model basis
-            self._gen_basis(times, vis, n, max_za)
-            # construct least squares equation
-            # take the real part since we omit the lower half of the vis matrix
-            M = np.zeros((n, n), dtype=np.float64)
-            v = np.zeros((n,), dtype=np.float64)
-            if t_stride > 1:
-                wgt_view = weight.reshape(t_stride * weight.shape[0],
-                                          weight.shape[1] / t_stride)
-                vis_view = vis.reshape(t_stride * vis.shape[0],
-                                       vis.shape[1] / t_stride)
-                basis = self._basis.reshape(t_stride * vis.shape[0],
-                                            vis.shape[1] / t_stride, n)
-                xtalk_view = np.concatenate([xtalk] * t_stride)
-            else:
-                wgt_view = weight
-                vis_view = vis
-                xtalk_view = xtalk
-                basis = self._basis
-            for t in range(vis_view.shape[1]):
-                M += np.dot(basis[:,t,:].T.conj() * wgt_view[:,t],
-                            basis[:,t,:]).real
-                v += np.dot(((vis_view[:,t] - xtalk_view) * wgt_view[:,t]).T,
-                            basis.conj()[:,t,:]).real
-            # normalize to order unity
-            #norm = np.median(np.abs(v))
-            #v /= norm
-            #M /= norm
-            # invert to solve
-            if rcond is None:
-                self.beam_sol = np.dot(np.linalg.inv(M), v)
-            else:
-                self.beam_sol = np.dot(np.linalg.pinv(M, rcond=rcond), v)
+            print("\rCrosstalk iteration {:d}/{:d}...".format(i+1, xtalk_iter)),
+            # least squares solution
+            self._lls_beam_sol(vis, weight, xtalk, rcond)
             # update cross-talk estimate using fit result
             resid = vis - self.get_vis(times, vis, n, max_za, self.beam_sol)
             #mad_resid = np.median(np.abs(resid - np.median(resid, axis=1)[:,np.newaxis]), axis=1)
             #xtalk = np.mean(resid * (np.abs(resid) < 3 * mad_resid[:,np.newaxis]), axis=1)
             #xtalk = np.sum(resid * weight, axis=-1) / np.sum(weight, axis=-1)
             xtalk = np.mean(resid, axis=-1)
-            del xtalk_view, vis_view, wgt_view, basis
         print("\nDone {:d} iterations.".format(self.total_iter))
-        # save intermediate products for debugging
-        self.M = M
-        self.v = v
         self.xtalk = xtalk
         # calculate chi^2
         self.chi2 = np.sum(np.abs((np.dot(self._basis, self.beam_sol) - vis))**2 * weight)
@@ -130,8 +95,50 @@ class ModelVis(object):
         self.cov = np.dot(V, np.dot(np.diag(1./S), V.T))
         return self.beam_sol
 
+    def lkhd_chain(self, times, vis, weight, n, max_za=90., rcond=None,
+                   num_steps=1000):
+        # TODO: implement a Gibbs sampled Markov chain for beam, xtalk
+        # starting parameters
+        xtalk_sample = np.zeros(vis.shape[0])
+        self._gen_basis(times, vis, n, max_za)
+        self._lls_beam_sol(vis, weight)
+        beam_sample = self.beam_sol
+        # compute model visibility
+        chain = {'beam': np.zeros((num_steps, n)), 'xtalk': np.zeros((num_steps, vis.shape[0]))}
+        for i in range(num_steps):
+            # TODO: draw a new cross-talk sample from conditional lkhd
+            xtalk_sample = draw_sample(vis, weight, beam_sample, fixed=xtalk_sample)
+            # TODO: draw a new beam sample from conditional lklhd
+            beam_sample = draw_sample(vis, weight, xtalk_sample, fixed=beam_sample)
+            chain['beam'][i] = beam_sample
+            chain['xtalk'][i] = xtalk_sample
+        self.chain = chain
+
+    def _lls_beam_sol(self, vis, weight, xtalk=0, rcond=None):
+        # construct least squares equation
+        # take the real part since we omit the lower half of the vis matrix
+        M = np.zeros((n, n), dtype=np.float64)
+        v = np.zeros((n,), dtype=np.float64)
+        for t in range(vis.shape[1]):
+            M += np.dot(self._basis[:,t,:].T.conj() * weight[:,t],
+                        self._basis[:,t,:]).real
+            v += np.dot(((vis[:,t] - xtalk) * weight[:,t]).T,
+                        self._basis.conj()[:,t,:]).real
+        # invert to solve
+        if rcond is None:
+            self.beam_sol = np.dot(np.linalg.inv(M), v)
+        else:
+            self.beam_sol = np.dot(np.linalg.pinv(M, rcond=rcond), v)
+        # save intermediate products for debugging
+        self.M = M
+        self.v = v
+
     def _gen_basis(self, times, vis, n, max_za=90.):
+        # TODO: pre-genrate a map of model sky convolved with EW beam
+        ew_beam = None  # TODO: write down beam model
+
         # evaluate Haslam map at n declinations and all times
+        # make za axis
         max_sinza = np.sin(np.radians(max_za))
         sinza = np.linspace(-max_sinza, max_sinza, n)
         za = np.arcsin(sinza)
@@ -142,12 +149,20 @@ class ModelVis(object):
         self.sinza = sinza
         self._basis = np.zeros((vis.shape[0], vis.shape[1], za.shape[0]), dtype=np.complex64)
         phases = np.exp(1j * self._fringe_phase(sinza))
+        # make EW grid to integrate over
+        phi = np.linspace(-self._res(), self._res(), 10)
+        z, p = np.meshgrid(za, phi)
+        alt, az = tel2azalt(z, p)
         for i, t in enumerate(times):
             sf_t = unix_to_skyfield_time(t)
-            pos = self.obs.at(sf_t).from_altaz(az_degrees=az, alt_degrees=alt)
-            gallat, gallon = pos.galactic_latlon()[:2]
-            pix = healpy.ang2pix(self.nside, gallon.degrees, gallat.degrees, lonlat=True)
-            self._basis[:,i,:] = self.smoothmap[pix] * phases
+            pix = np.zeros((alt.shape[0], alt.shape[1]),
+                           dtype=[('gallat', np.float32), ('gallon', np.float32)])
+            for j in range(alt.shape[0]):
+                for k in range(alt.shape[1]):
+                    pos = self.obs.at(sf_t).from_altaz(az_degrees=az[j,k], alt_degrees=alt[j,k])
+                    gallat, gallon = pos.galactic_latlon()[:2]
+                    pix[j,k] = healpy.ang2pix(self.nside, gallon.degrees, gallat.degrees, lonlat=True)
+            self._basis[:,i,:] = np.sum(self.smoothmap[pix] * ew_beam * phases, axis=0)
 
     def _res(self):
         # match FWHM of sinc for 20m aperture
@@ -155,3 +170,41 @@ class ModelVis(object):
 
     def _fringe_phase(self, sinza):
         return 2 * np.pi * self.ns_baselines[:,np.newaxis] / self.wl * sinza[np.newaxis,:]
+
+
+def altaz2tel(alt, az, deg=False, reverse=False):
+    if deg:
+        alt, az = np.radians(alt), np.radians(az)
+    az = az % (2 * np.pi)
+
+    # rotate so that origin is in the S
+    az += np.pi
+
+    # calculate new coordinates
+    theta = np.arctan(- (np.cos(az) * np.cos(alt)) /
+                      np.sqrt(np.sin(alt)**2 + np.sin(az)**2 * np.cos(alt)**2))
+    phi = np.arctan(- np.sin(az) / np.tan(alt))
+    if reverse:
+        phi[np.sin(alt) < 0] = np.pi - phi[np.sin(alt) < 0]
+        #theta *= -1
+    else:
+        phi[np.sin(alt) < 0] = np.pi - phi[np.sin(alt) < 0]
+
+    if reverse:
+        # azimuth goes clockwise
+        phi = (2*np.pi - phi) % (2*np.pi)
+        # undo rotation
+        #phi = (phi + np.pi) % (2*np.pi)
+
+    # special case at origin
+    zero_case = np.logical_and(np.isclose(az, 0.), np.isclose(alt, 0.))
+    phi[zero_case] = 0.
+    theta[zero_case] = np.pi/2.
+
+    if deg:
+        theta, phi = np.degrees(theta), np.degrees(phi)
+    return theta, phi
+
+
+def tel2azalt(theta, phi, deg=False):
+    return altaz2tel(theta, phi, reverse=True, deg=deg)
