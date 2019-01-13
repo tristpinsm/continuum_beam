@@ -61,7 +61,7 @@ class ModelVis(object):
             raise Exception("No chi^2 is available until a fit is performed.")
 
     def fit_beam(self, times, vis, weight, n, max_za=90., rcond=None,
-                 xtalk_iter=1, resume=False):
+                 xtalk_iter=1, chain_len=500, resume=False):
 
         # Initialize xtalk
         if resume and self.xtalk is not None:
@@ -74,19 +74,28 @@ class ModelVis(object):
             # generate model basis
             self._gen_basis(times, vis, n, max_za)
 
+        xtalk_step = 0.1 * np.mean(np.abs(vis), axis=-1)
+
         # least squares beam fit, crosstalk iterations
         for i in range(xtalk_iter):
             print("\rCrosstalk iteration {:d}/{:d}...".format(i+1, xtalk_iter)),
             # least squares solution
             self._lls_beam_sol(vis, weight, n, xtalk, rcond)
+            # update chain step size
+            if i > 0:
+                xtalk_step = np.std(np.abs(xchain['xtalk']), axis=0)
             # update cross-talk estimate using fit result
-            resid = vis - self.get_vis(times, vis, n, max_za, self.beam_sol)
+            xchain = self.xtalk_chain(times, vis, weight, n, max_za, xtalk, chain_len,
+                                      skip_basis=True, step=xtalk_step)
+            #resid = vis - self.get_vis(times, vis, n, max_za, self.beam_sol)
             #mad_resid = np.median(np.abs(resid - np.median(resid, axis=1)[:,np.newaxis]), axis=1)
             #xtalk = np.mean(resid * (np.abs(resid) < 3 * mad_resid[:,np.newaxis]), axis=1)
             #xtalk = np.sum(resid * weight, axis=-1) / np.sum(weight, axis=-1)
-            xtalk = np.mean(resid, axis=-1)
+            #xtalk = np.mean(resid, axis=-1)
+            xtalk = np.mean(xchain['xtalk'], axis=0)
         print("\nDone {:d} iterations.".format(self.total_iter))
         self.xtalk = xtalk
+        self.xchain = xchain
         # calculate chi^2
         self.chi2 = np.sum(np.abs((np.dot(self._basis, self.beam_sol) - vis))**2 * weight)
         # calculate covariance
@@ -94,9 +103,53 @@ class ModelVis(object):
         self.cov = np.dot(V, np.dot(np.diag(1./S), V.T))
         return self.beam_sol
 
+    def xtalk_chain(self, times, vis, weight, n, max_za=90., xtalk_sample=None,
+                    num_steps=1000, step=None, skip_basis=False):
+        # starting parameters
+        if xtalk_sample is None:
+            xtalk_sample = np.zeros(vis.shape[0])
+        if not skip_basis:
+            self._gen_basis(times, vis, n, max_za)
+        model_vis = self.get_vis(times, vis, n, max_za, skip_basis=True,
+                                 model_beam=self.beam_sol)
+        if step is None:
+            step = 0.1 * np.mean(np.abs(vis), axis=-1)
+
+        # likelihood calculation
+        def chi2_lnlkhd(x_sample):
+            return - np.sum(np.abs(vis - x_sample[:,np.newaxis] - model_vis)**2 * weight)
+
+        # proposal distribution
+        def chain_step(sample):
+            real_part = np.random.normal(scale=step / np.sqrt(2), size=sample.shape)
+            imag_part = 1j * np.random.normal(scale=step / np.sqrt(2), size=sample.shape)
+            return sample + real_part + imag_part
+
+        # likelihood for starting params
+        last_lnlkhd = chi2_lnlkhd(xtalk_sample)
+
+        # initialize chain
+        chain = {'xtalk': np.zeros((num_steps, vis.shape[0]), dtype=np.complex64),
+                 'accept': np.zeros(num_steps, dtype=np.int8),
+                 'lnlkhd': np.zeros(num_steps)}
+        for i in range(num_steps):
+            # draw a new cross-talk sample from conditional lkhd
+            xtalk_sample_new = chain_step(xtalk_sample)
+            new_lnlkhd = chi2_lnlkhd(xtalk_sample_new)
+            if (new_lnlkhd >= last_lnlkhd or
+                    np.exp(new_lnlkhd - last_lnlkhd) > np.random.uniform()):
+                # accept sample
+                xtalk_sample = xtalk_sample_new
+                last_lnlkhd = new_lnlkhd
+                chain['accept'][i] = 1
+            chain['lnlkhd'][i] = new_lnlkhd
+
+            chain['xtalk'][i] = xtalk_sample
+
+        return chain
+
     def compute_lkhd_chain(self, times, vis, weight, n, max_za=90., rcond=None,
-                           num_steps=1000, step_tweaks=(0.1,0.1), skip_basis=False):
-        # TODO: implement a Gibbs sampled Markov chain for beam, xtalk
+                           num_steps=1000, step_tweaks=(0.1, 0.1), skip_basis=False):
         # starting parameters
         xtalk_sample = np.zeros(vis.shape[0])
         if not skip_basis:
