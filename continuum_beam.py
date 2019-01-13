@@ -94,23 +94,69 @@ class ModelVis(object):
         self.cov = np.dot(V, np.dot(np.diag(1./S), V.T))
         return self.beam_sol
 
-    def lkhd_chain(self, times, vis, weight, n, max_za=90., rcond=None,
-                   num_steps=1000):
+    def compute_lkhd_chain(self, times, vis, weight, n, max_za=90., rcond=None,
+                           num_steps=1000, step_tweaks=(0.1,0.1), skip_basis=False):
         # TODO: implement a Gibbs sampled Markov chain for beam, xtalk
         # starting parameters
         xtalk_sample = np.zeros(vis.shape[0])
-        self._gen_basis(times, vis, n, max_za)
-        self._lls_beam_sol(vis, weight)
+        if not skip_basis:
+            self._gen_basis(times, vis, n, max_za)
+        self._lls_beam_sol(vis, weight, n)
         beam_sample = self.beam_sol
-        # compute model visibility
-        chain = {'beam': np.zeros((num_steps, n)), 'xtalk': np.zeros((num_steps, vis.shape[0]))}
+        # make a choice for proposal steps
+        beam_step = step_tweaks[1] * np.mean(np.abs(beam_sample))
+        xtalk_step = step_tweaks[0] * np.mean(np.abs(vis), axis=-1)
+
+        # likelihood calculation
+        def chi2_lnlkhd(x_sample, b_sample):
+            model_vis = self.get_vis(times, vis, n, max_za, skip_basis=True,
+                                     model_beam=b_sample)
+            return - np.sum(np.abs(vis - x_sample[:,np.newaxis] - model_vis)**2 * weight)
+
+        # proposal distribution
+        def chain_step(sample, sig=1., imag=False):
+            base = 1j if imag else 1.
+            return sample + base * np.random.normal(scale=sig, size=sample.shape)
+
+        # likelihood for starting params
+        last_lnlkhd = chi2_lnlkhd(xtalk_sample, beam_sample)
+
+        # initialize chain
+        chain = {'beam': np.zeros((num_steps, n)),
+                 'xtalk': np.zeros((num_steps, vis.shape[0]), dtype=np.complex64),
+                 'accept': np.zeros((num_steps, 2), dtype=np.int8),
+                 'lnlkhd': np.zeros((num_steps, 2))}
         for i in range(num_steps):
-            # TODO: draw a new cross-talk sample from conditional lkhd
-            xtalk_sample = draw_sample(vis, weight, beam_sample, fixed=xtalk_sample)
-            # TODO: draw a new beam sample from conditional lklhd
-            beam_sample = draw_sample(vis, weight, xtalk_sample, fixed=beam_sample)
+            if i % 10 == 0:
+                print("\rStep {:d}/{:d}...".format(i, num_steps)),
+            # draw a new cross-talk sample from conditional lkhd
+            xtalk_sample_new = chain_step(xtalk_sample, xtalk_step / np.sqrt(2))
+            xtalk_sample_new = chain_step(xtalk_sample_new, xtalk_step / np.sqrt(2), imag=True)
+            new_lnlkhd = chi2_lnlkhd(xtalk_sample_new, beam_sample)
+            if (new_lnlkhd >= last_lnlkhd or
+                    np.exp(new_lnlkhd - last_lnlkhd) > np.random.uniform()):
+                # accept sample
+                xtalk_sample = xtalk_sample_new
+                last_lnlkhd = new_lnlkhd
+                chain['accept'][i,0] = 1
+            chain['lnlkhd'][i,0] = new_lnlkhd
+
+            # draw and evaluate beam sample
+            beam_sample_new = chain_step(beam_sample, beam_step)
+            #self._lls_beam_sol(vis, weight, n, xtalk=xtalk_sample)
+            #beam_sample_new = self.beam_sol
+            new_lnlkhd = chi2_lnlkhd(xtalk_sample, beam_sample_new)
+            if (new_lnlkhd >= last_lnlkhd or
+                    np.exp(new_lnlkhd - last_lnlkhd) > np.random.uniform()):
+                # accept sample
+                beam_sample = beam_sample_new
+                last_lnlkhd = new_lnlkhd
+                chain['accept'][i,1] = 1
+            chain['lnlkhd'][i,1] = new_lnlkhd
+
             chain['beam'][i] = beam_sample
             chain['xtalk'][i] = xtalk_sample
+
         self.chain = chain
 
     def _lls_beam_sol(self, vis, weight, n, xtalk=0, rcond=None):
@@ -146,7 +192,7 @@ class ModelVis(object):
         self.sinza = sinza
         self._basis = np.zeros((vis.shape[0], vis.shape[1], za.shape[0]), dtype=np.complex64)
         # make EW grid to integrate over
-        phi = np.linspace(-8*self._res(), 8*self._res(), 20)
+        phi = np.linspace(-8*self._res(), 8*self._res(), 40)
         z, p = np.meshgrid(za, phi)
         self.z, self.p = z, p
         alt, az = tel2azalt(z, p)
