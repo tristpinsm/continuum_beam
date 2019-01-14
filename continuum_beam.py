@@ -10,7 +10,7 @@ class ModelVis(object):
     synch_ind = -0.75
 
     def __init__(self, fname="./lambda_haslam408_nofilt.fits", freq=408., smooth=True,
-                 sky_map=None):
+                 sky_map=None, max_za=90., harm_basis=False):
         # observed frequency
         self.freq = freq
         self.wl = self.c / freq
@@ -36,6 +36,10 @@ class ModelVis(object):
         # get an observer at CHIME arguments
         self.obs = ephem.chime_observer().skyfield_obs()
 
+        # set fitting constraints
+        self.max_za = max_za
+        self.harm_basis = harm_basis
+
         self.xtalk = None
         self.chi2 = None
 
@@ -60,8 +64,8 @@ class ModelVis(object):
         else:
             raise Exception("No chi^2 is available until a fit is performed.")
 
-    def fit_beam(self, times, vis, weight, n, max_za=90., rcond=None,
-                 xtalk_iter=1, chain_len=500, resume=False):
+    def fit_beam(self, times, vis, weight, n, max_za=90., set_beam=None,
+                 rcond=None, xtalk_iter=1, chain_len=500, resume=False):
 
         # Initialize xtalk
         if resume and self.xtalk is not None:
@@ -80,7 +84,10 @@ class ModelVis(object):
         for i in range(xtalk_iter):
             print("\rCrosstalk iteration {:d}/{:d}...".format(i+1, xtalk_iter)),
             # least squares solution
-            self._lls_beam_sol(vis, weight, n, xtalk, rcond)
+            if i == 0 and set_beam is not None:
+                self.beam_sol = set_beam
+            else:
+                self._lls_beam_sol(vis, weight, n, xtalk, rcond)
             # update chain step size
             if i > 0:
                 xtalk_step = np.std(np.abs(xchain['xtalk']), axis=0)
@@ -107,6 +114,7 @@ class ModelVis(object):
                     num_steps=1000, step=None, skip_basis=False):
         # starting parameters
         if xtalk_sample is None:
+            # TODO: consider starting with vis average
             xtalk_sample = np.zeros(vis.shape[0])
         if not skip_basis:
             self._gen_basis(times, vis, n, max_za)
@@ -233,19 +241,21 @@ class ModelVis(object):
 
     def _gen_basis(self, times, vis, n, max_za=90.):
 
-        # evaluate Haslam map at n declinations and all times
         # make za axis
         max_sinza = np.sin(np.radians(max_za))
-        sinza = np.linspace(-max_sinza, max_sinza, n)
+        if self.harm_basis:
+            sinza = np.linspace(-max_sinza, max_sinza, 2*int(2*np.radians(max_za)/np.pi * n))
+        else:
+            sinza = np.linspace(-max_sinza, max_sinza, n)
         za = np.arcsin(sinza)
         az = np.zeros_like(za)
-        az[:n/2] = 180.
+        az[:az.shape[0]/2] = 180.
         alt = 90. - np.cos(np.radians(az)) * np.degrees(za)
         self.za = za
         self.sinza = sinza
-        self._basis = np.zeros((vis.shape[0], vis.shape[1], za.shape[0]), dtype=np.complex64)
+        self._basis = np.zeros((vis.shape[0], vis.shape[1], n), dtype=np.complex64)
         # make EW grid to integrate over
-        phi = np.linspace(-8*self._res(), 8*self._res(), 40)
+        phi = np.linspace(-2*self._res(), 2*self._res(), 20)
         z, p = np.meshgrid(za, phi)
         self.z, self.p = z, p
         alt, az = tel2azalt(z, p)
@@ -265,9 +275,13 @@ class ModelVis(object):
                     gallat, gallon = pos.galactic_latlon()[:2]
                     pix[j,k] = healpy.ang2pix(self.nside, gallon.degrees, gallat.degrees, lonlat=True)
             if len(phases.shape) > 2:
-                self._basis[:,i,:] = np.sum(self.smoothmap[pix] * ew_beam * phases, axis=1)
+                basis = np.sum(self.smoothmap[pix] * ew_beam * phases, axis=1)
             else:
-                self._basis[:,i,:] = self.smoothmap[pix] * ew_beam * phases
+                basis = self.smoothmap[pix] * ew_beam * phases
+            if self.harm_basis:
+                # convolve NS slice with basis functions
+                basis = np.dot(basis, np.sin(np.arange(1, n+1)[np.newaxis,:] * (za[:,np.newaxis] + np.pi/2)))
+            self._basis[:,i,:] = basis
 
     def _res(self):
         # match FWHM of sinc for 20m aperture
